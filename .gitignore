@@ -1,1 +1,5 @@
 /target
+triangular-db.toml
+tree.json
+/tree
+Cargo.lock
