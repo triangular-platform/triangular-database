@@ -1,291 +1,178 @@
 // Copyright (c) 2025, TheByteSlayer, Triangular
 // Stores structured Data in JSON Files and makes it accessible over TCP, written in Rust.
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::error::Error;
-use std::fs;
-use serde_json::{Value, Map};
-use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::thread;
+use crate::configuration::Config;
+use crate::tree;
 
-pub async fn start_tcp_server(address: &str) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(address).await?;
+static API_MANAGER: OnceLock<ApiManager> = OnceLock::new();
+
+struct ThreadPool {
+    sender: mpsc::Sender<Job>,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+impl ThreadPool {
+    fn new(size: usize) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        
+        // Spawn worker threads without storing their handles
+        for _ in 0..size {
+            let receiver = std::sync::Arc::clone(&receiver);
+            thread::spawn(move || loop {
+                let job: Job = receiver.lock().unwrap().recv().unwrap();
+                job();
+            });
+        }
+        
+        ThreadPool { sender }
+    }
     
-    loop {
-        let (socket, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
-                eprintln!("Error handling client: {}", e);
-            }
-        });
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+        self.sender.send(job).unwrap();
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn Error>> {
-    let mut buffer = [0; 1024];
-    
-    loop {
-        let n = socket.read(&mut buffer).await?;
-        if n == 0 {
-            break;
+pub struct ApiManager {
+    thread_pool: ThreadPool,
+}
+
+impl ApiManager {
+    pub fn new() -> Self {
+        let thread_pool_size = num_cpus::get();
+        let thread_pool = ThreadPool::new(thread_pool_size);
+        Self {
+            thread_pool,
         }
+    }
+
+    fn handle_connection(mut stream: TcpStream, silent: bool) {
+        let mut buffer = [0; 1024];
         
-        let request = String::from_utf8_lossy(&buffer[..n]);
-        let response = process_request(&request).await;
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let request = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+                    
+                    if request.is_empty() {
+                        continue;
+                    }
+                    
+                    let response = process_request(&request);
+                    
+                    if let Err(e) = stream.write_all(response.as_bytes()) {
+                        if !silent {
+                            eprintln!("Failed to write response: {}", e);
+                        }
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if !silent {
+                        eprintln!("Error reading from stream: {}", e);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub fn get_api_manager() -> &'static ApiManager {
+    API_MANAGER.get_or_init(|| ApiManager::new())
+}
+
+pub fn start_server(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let manager = get_api_manager();
+    let listener = TcpListener::bind(config.address())?;
+    
+    if !config.silent {
+        println!("Triangular Database listening on {}", config.address());
+    }
+    
+    let silent = config.silent;
+    
+    for stream in listener.incoming() {
+        let stream = stream?;
         
-        socket.write_all(response.as_bytes()).await?;
+        manager.thread_pool.execute(move || {
+            ApiManager::handle_connection(stream, silent);
+        });
     }
     
     Ok(())
 }
 
-async fn process_request(request: &str) -> String {
-    let request = request.trim();
+pub fn process_request(request: &str) -> String {
     let parts: Vec<&str> = request.split_whitespace().collect();
     
     if parts.is_empty() {
-        return "Error: Empty command".to_string();
+        return "ERROR: Empty request".to_string();
     }
     
     let command = parts[0].to_uppercase();
     
     match command.as_str() {
         "INIT" => {
-            if parts.len() >= 3 {
-                let container = parts[1];
-                let value = parts[2];
-                match handle_init_command(container, value).await {
-                    Ok(msg) => msg,
-                    Err(e) => format!("Error: {}", e),
-                }
-            } else {
-                "Error: INIT requires container and value".to_string()
+            if parts.len() < 3 {
+                return "ERROR: INIT requires container and value".to_string();
             }
+            
+            let container = parts[1];
+            let value = parts[2];
+            
+            tree::handle_init(container, value)
         }
         "SET" => {
-            if parts.len() >= 5 {
-                let container = parts[1];
-                let module = parts[2];
-                let key = parts[3];
-                let value = parts[4];
-                match handle_set_command(container, module, key, value).await {
-                    Ok(msg) => msg,
-                    Err(e) => format!("Error: {}", e),
-                }
-            } else {
-                "Error: SET requires container, module, key, and value".to_string()
+            if parts.len() < 5 {
+                return "ERROR: SET requires container, module, key, and value".to_string();
             }
+            
+            let container = parts[1];
+            let module = parts[2];
+            let key = parts[3];
+            let value = parts[4];
+            
+            tree::handle_set(container, module, key, value)
         }
         "GET" => {
-            if parts.len() >= 4 {
-                let container = parts[1];
-                let module = parts[2];
-                let key = parts[3];
-                match handle_get_command(container, module, key).await {
-                    Ok(msg) => msg,
-                    Err(e) => format!("Error: {}", e),
-                }
-            } else {
-                "Error: GET requires container, module, and key".to_string()
+            if parts.len() < 4 {
+                return "ERROR: GET requires container, module, and key".to_string();
             }
-        }
-        "CONTAINERS" => {
-            match handle_containers_command().await {
-                Ok(msg) => msg,
-                Err(e) => format!("Error: {}", e),
-            }
-        }
-        "MODULES" => {
-            if parts.len() >= 2 {
-                let container = parts[1];
-                match handle_modules_command(container).await {
-                    Ok(msg) => msg,
-                    Err(e) => format!("Error: {}", e),
-                }
-            } else {
-                "Error: MODULES requires container".to_string()
-            }
-        }
-        "KEYS" => {
-            if parts.len() >= 3 {
-                let container = parts[1];
-                let module = parts[2];
-                match handle_keys_command(container, module).await {
-                    Ok(msg) => msg,
-                    Err(e) => format!("Error: {}", e),
-                }
-            } else {
-                "Error: KEYS requires container and module".to_string()
-            }
-        }
-        _ => format!("Unknown command: {}", command),
-    }
-}
-
-async fn handle_init_command(container: &str, value: &str) -> Result<String, Box<dyn Error>> {
-    // Read tree.json to get the template
-    let tree_content = fs::read_to_string("tree.json")?;
-    let tree_data: Value = serde_json::from_str(&tree_content)?;
-    
-    // Find the container in the tree
-    if let Value::Object(root_map) = &tree_data {
-        if let Some(container_template) = root_map.get(container) {
-            // Process the template and replace "module" with the provided value
-            let processed_data = process_template(container_template, value)?;
             
-            // Write to container.json file
-            let container_file_path = format!("tree/{}.json", container);
-            let json_output = serde_json::to_string_pretty(&processed_data)?;
-            fs::write(&container_file_path, json_output)?;
+            let container = parts[1];
+            let module = parts[2];
+            let key = parts[3];
             
-            Ok(format!("INIT {} in Container '{}'", value, container))
-        } else {
-            Err(format!("Container '{}' not found in tree.json", container).into())
+            tree::handle_get(container, module, key)
         }
-    } else {
-        Err("Invalid tree.json format".into())
-    }
-}
-
-async fn handle_set_command(container: &str, module: &str, key: &str, value: &str) -> Result<String, Box<dyn Error>> {
-    // First check if the key exists in tree.json
-    let tree_content = fs::read_to_string("tree.json")?;
-    let tree_data: Value = serde_json::from_str(&tree_content)?;
-    
-    // Verify the key exists in tree.json structure
-    if let Value::Object(root_map) = &tree_data {
-        if let Some(Value::Object(container_obj)) = root_map.get(container) {
-            if let Some(Value::Object(module_obj)) = container_obj.get("module") {
-                if !module_obj.contains_key(key) {
-                    return Err(format!("Key '{}' not defined in tree.json for container '{}'", key, container).into());
-                }
+        "LIST" => {
+            if parts.len() < 2 {
+                return "ERROR: LIST requires container".to_string();
+            }
+            
+            let container = parts[1];
+            
+            if parts.len() == 2 {
+                tree::handle_list_modules(container)
+            } else if parts.len() == 3 {
+                let module = parts[2];
+                tree::handle_list_keys(container, module)
             } else {
-                return Err(format!("Module structure not found in tree.json for container '{}'", container).into());
+                "ERROR: LIST takes 1 or 2 arguments".to_string()
             }
-        } else {
-            return Err(format!("Container '{}' not found in tree.json", container).into());
         }
-    }
-    
-    // Read the container file
-    let container_file_path = format!("tree/{}.json", container);
-    if !Path::new(&container_file_path).exists() {
-        return Err(format!("Container file '{}' does not exist", container_file_path).into());
-    }
-    
-    let container_content = fs::read_to_string(&container_file_path)?;
-    let mut container_data: Value = serde_json::from_str(&container_content)?;
-    
-    // Update the value
-    if let Value::Object(root_map) = &mut container_data {
-        if let Some(Value::Object(module_obj)) = root_map.get_mut(module) {
-            module_obj.insert(key.to_string(), Value::String(value.to_string()));
-        } else {
-            return Err(format!("Module '{}' not found in container '{}'", module, container).into());
-        }
-    }
-    
-    // Write back to file
-    let json_output = serde_json::to_string_pretty(&container_data)?;
-    fs::write(&container_file_path, json_output)?;
-    
-    Ok(format!("SET {} {}", key, value))
-}
-
-async fn handle_get_command(container: &str, module: &str, key: &str) -> Result<String, Box<dyn Error>> {
-    let container_file_path = format!("tree/{}.json", container);
-    if !Path::new(&container_file_path).exists() {
-        return Err(format!("Container file '{}' does not exist", container_file_path).into());
-    }
-    
-    let container_content = fs::read_to_string(&container_file_path)?;
-    let container_data: Value = serde_json::from_str(&container_content)?;
-    
-    if let Value::Object(root_map) = &container_data {
-        if let Some(Value::Object(module_obj)) = root_map.get(module) {
-            if let Some(value) = module_obj.get(key) {
-                Ok(value.as_str().unwrap_or("").to_string())
-            } else {
-                Err(format!("Key '{}' not found in module '{}' of container '{}'", key, module, container).into())
-            }
-        } else {
-            Err(format!("Module '{}' not found in container '{}'", module, container).into())
-        }
-    } else {
-        Err("Invalid container file format".into())
-    }
-}
-
-async fn handle_containers_command() -> Result<String, Box<dyn Error>> {
-    let tree_content = fs::read_to_string("tree.json")?;
-    let tree_data: Value = serde_json::from_str(&tree_content)?;
-    
-    if let Value::Object(root_map) = &tree_data {
-        let containers: Vec<String> = root_map.keys().cloned().collect();
-        Ok(containers.join(", "))
-    } else {
-        Err("Invalid tree.json format".into())
-    }
-}
-
-async fn handle_modules_command(container: &str) -> Result<String, Box<dyn Error>> {
-    let container_file_path = format!("tree/{}.json", container);
-    if !Path::new(&container_file_path).exists() {
-        return Err(format!("Container file '{}' does not exist", container_file_path).into());
-    }
-    
-    let container_content = fs::read_to_string(&container_file_path)?;
-    let container_data: Value = serde_json::from_str(&container_content)?;
-    
-    if let Value::Object(root_map) = &container_data {
-        let modules: Vec<String> = root_map.keys().cloned().collect();
-        Ok(modules.join(", "))
-    } else {
-        Err("Invalid container file format".into())
-    }
-}
-
-async fn handle_keys_command(container: &str, module: &str) -> Result<String, Box<dyn Error>> {
-    let container_file_path = format!("tree/{}.json", container);
-    if !Path::new(&container_file_path).exists() {
-        return Err(format!("Container file '{}' does not exist", container_file_path).into());
-    }
-    
-    let container_content = fs::read_to_string(&container_file_path)?;
-    let container_data: Value = serde_json::from_str(&container_content)?;
-    
-    if let Value::Object(root_map) = &container_data {
-        if let Some(Value::Object(module_obj)) = root_map.get(module) {
-            let keys: Vec<String> = module_obj.keys().cloned().collect();
-            Ok(keys.join(", "))
-        } else {
-            Err(format!("Module '{}' not found in container '{}'", module, container).into())
-        }
-    } else {
-        Err("Invalid container file format".into())
-    }
-}
-
-fn process_template(template: &Value, replacement_value: &str) -> Result<Value, Box<dyn Error>> {
-    match template {
-        Value::Object(obj) => {
-            let mut new_obj = Map::new();
-            for (key, val) in obj {
-                if key == "module" {
-                    // Replace the "module" key with the replacement value
-                    new_obj.insert(replacement_value.to_string(), process_template(val, replacement_value)?);
-                } else {
-                    new_obj.insert(key.clone(), process_template(val, replacement_value)?);
-                }
-            }
-            Ok(Value::Object(new_obj))
-        }
-        Value::Array(arr) => {
-            let new_arr: Result<Vec<Value>, Box<dyn Error>> = arr.iter()
-                .map(|v| process_template(v, replacement_value))
-                .collect();
-            Ok(Value::Array(new_arr?))
-        }
-        _ => Ok(template.clone()),
+        _ => "ERROR: Unknown command".to_string(),
     }
 } 

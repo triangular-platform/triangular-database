@@ -9,6 +9,7 @@ use std::path::Path;
 pub struct Config {
     pub ip: String,
     pub port: u16,
+    pub silent: bool,
 }
 
 impl Default for Config {
@@ -16,6 +17,7 @@ impl Default for Config {
         Config {
             ip: "0.0.0.0".to_string(),
             port: 8080,
+            silent: false,
         }
     }
 }

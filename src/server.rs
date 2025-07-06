@@ -1,25 +1,33 @@
 // Copyright (c) 2025, TheByteSlayer, Triangular
 // Stores structured Data in JSON Files and makes it accessible over TCP, written in Rust.
 
+mod tree;
 mod configuration;
 mod api;
-mod tree;
 
+use tree::initialize_tree;
 use configuration::Config;
-use api::start_tcp_server;
-use tree::{initialize_tree, create_containers};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load_or_create()?;
+fn main() {
+    let config = Config::load_or_create().unwrap();
     
-    initialize_tree()?;
+    if let Err(e) = initialize_tree() {
+        if !config.silent {
+            eprintln!("Failed to initialize tree: {}", e);
+        }
+        return;
+    }
     
-    println!("Triangular Database listening on {}", config.address());
+    if let Err(e) = tree::initialize_containers(config.silent) {
+        if !config.silent {
+            eprintln!("Failed to initialize containers: {}", e);
+        }
+        return;
+    }
     
-    create_containers()?;
-    
-    start_tcp_server(&config.address()).await?;
-    
-    Ok(())
+    if let Err(e) = api::start_server(&config) {
+        if !config.silent {
+            eprintln!("Server error: {}", e);
+        }
+    }
 } 
